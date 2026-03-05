@@ -8,60 +8,119 @@ from ta.trend import MACD
 
 st.set_page_config(layout="wide")
 
-st.title("TSLA Institutional Short-Term Prediction System")
+st.title("TSLA Institutional Prediction System")
 
-# ---------------------------
-# 获取数据
-# ---------------------------
-@st.cache_data
+# -----------------------------
+# 数据下载
+# -----------------------------
+@st.cache_data(ttl=300)
 def load_data():
-    df = yf.download("TSLA", period="5d", interval="5m")
+
+    df = yf.download(
+        "TSLA",
+        period="5d",
+        interval="15m",
+        progress=False
+    )
+
+    if df is None or df.empty:
+        return None
+
+    df = df.dropna()
+
     return df
+
 
 df = load_data()
 
-# ---------------------------
+if df is None:
+    st.error("Market data unavailable. Please refresh later.")
+    st.stop()
+
+# -----------------------------
+# 修复 dataframe 结构
+# -----------------------------
+df["Close"] = df["Close"].astype(float)
+df["Volume"] = df["Volume"].astype(float)
+
+price_series = df["Close"].squeeze()
+volume_series = df["Volume"].squeeze()
+
+# -----------------------------
 # 技术指标
-# ---------------------------
-df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
+# -----------------------------
+try:
+    df["RSI"] = RSIIndicator(price_series, window=14).rsi()
 
-macd = MACD(df["Close"])
-df["MACD"] = macd.macd()
-df["MACD_signal"] = macd.macd_signal()
+    macd = MACD(price_series)
+    df["MACD"] = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
 
-# ---------------------------
-# 成交密集区 (Volume Profile)
-# ---------------------------
+except:
+    df["RSI"] = np.nan
+    df["MACD"] = np.nan
+    df["MACD_signal"] = np.nan
+
+
+# -----------------------------
+# Volume Profile
+# -----------------------------
 def volume_profile(data, bins=30):
-    
-    price = data["Close"]
-    volume = data["Volume"]
-    
-    hist, edges = np.histogram(price, bins=bins, weights=volume)
-    
+
+    price = data["Close"].squeeze()
+    volume = data["Volume"].squeeze()
+
+    if len(price) == 0:
+        return pd.DataFrame({"price": [], "volume": []})
+
+    hist, edges = np.histogram(
+        price,
+        bins=bins,
+        weights=volume
+    )
+
     vp = pd.DataFrame({
         "price": edges[:-1],
         "volume": hist
     })
-    
+
     return vp
+
 
 vp = volume_profile(df)
 
-poc = vp.loc[vp["volume"].idxmax(), "price"]
+if not vp.empty:
+    poc = vp.loc[vp["volume"].idxmax(), "price"]
+else:
+    poc = price_series.iloc[-1]
 
-# ---------------------------
+
+# -----------------------------
 # 市场环境
-# ---------------------------
-spy = yf.download("SPY", period="2d", interval="5m")
-vix = yf.download("^VIX", period="2d", interval="5m")
+# -----------------------------
+@st.cache_data(ttl=300)
+def market_context():
 
-spy_change = (spy["Close"].iloc[-1] - spy["Close"].iloc[-10]) / spy["Close"].iloc[-10]
-vix_level = vix["Close"].iloc[-1]
+    spy = yf.download("SPY", period="2d", interval="30m", progress=False)
+    vix = yf.download("^VIX", period="2d", interval="30m", progress=False)
 
-# ---------------------------
+    if spy.empty or vix.empty:
+        return 0, 20
+
+    spy_change = (
+        spy["Close"].iloc[-1] - spy["Close"].iloc[-5]
+    ) / spy["Close"].iloc[-5]
+
+    vix_level = vix["Close"].iloc[-1]
+
+    return spy_change, vix_level
+
+
+spy_change, vix_level = market_context()
+
+# -----------------------------
 # 情绪评分
-# ---------------------------
+# -----------------------------
 sentiment = 0
 
 if spy_change > 0:
@@ -74,24 +133,24 @@ if vix_level < 18:
 else:
     sentiment -= 1
 
-rsi = df["RSI"].iloc[-1]
+rsi_value = df["RSI"].iloc[-1]
 
-if rsi < 35:
+if pd.notna(rsi_value) and rsi_value < 35:
     sentiment += 1
 
-# ---------------------------
+# -----------------------------
 # 预测模型
-# ---------------------------
-price = df["Close"].iloc[-1]
+# -----------------------------
+current_price = price_series.iloc[-1]
 
-expected_move = price * 0.025
+expected_move = current_price * 0.025
 
-low = price - expected_move
-high = price + expected_move
+pred_low = current_price - expected_move
+pred_high = current_price + expected_move
 
-# ---------------------------
-# 图表
-# ---------------------------
+# -----------------------------
+# K线图
+# -----------------------------
 fig = go.Figure()
 
 fig.add_trace(
@@ -100,28 +159,94 @@ fig.add_trace(
         open=df["Open"],
         high=df["High"],
         low=df["Low"],
-        close=df["Close"]
+        close=df["Close"],
+        name="TSLA"
     )
 )
 
-fig.add_hline(y=poc, line_dash="dash")
+fig.add_hline(
+    y=poc,
+    line_dash="dash",
+    annotation_text="POC"
+)
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------
-# 输出
-# ---------------------------
-col1, col2, col3 = st.columns(3)
+# -----------------------------
+# 指标面板
+# -----------------------------
+col1, col2, col3, col4 = st.columns(4)
 
-col1.metric("Current Price", round(price,2))
-col2.metric("POC (筹码中心)", round(poc,2))
-col3.metric("RSI", round(rsi,2))
+col1.metric(
+    "Price",
+    round(current_price, 2)
+)
 
-st.subheader("Predicted Range")
+col2.metric(
+    "POC",
+    round(poc, 2)
+)
 
-st.write(f"Low: {round(low,2)}")
-st.write(f"High: {round(high,2)}")
+col3.metric(
+    "RSI",
+    round(rsi_value, 2) if pd.notna(rsi_value) else "NA"
+)
 
+col4.metric(
+    "VIX",
+    round(vix_level, 2)
+)
+
+# -----------------------------
+# 预测区间
+# -----------------------------
+st.subheader("Predicted Daily Range")
+
+c1, c2 = st.columns(2)
+
+c1.metric(
+    "Predicted Low",
+    round(pred_low, 2)
+)
+
+c2.metric(
+    "Predicted High",
+    round(pred_high, 2)
+)
+
+# -----------------------------
+# 市场情绪
+# -----------------------------
 st.subheader("Market Sentiment Score")
 
-st.write(sentiment)
+if sentiment > 1:
+    st.success(f"Bullish ({sentiment})")
+
+elif sentiment == 1:
+    st.info(f"Slightly Bullish ({sentiment})")
+
+elif sentiment == 0:
+    st.warning("Neutral")
+
+else:
+    st.error(f"Bearish ({sentiment})")
+
+# -----------------------------
+# Volume Profile 图
+# -----------------------------
+st.subheader("Volume Profile")
+
+if not vp.empty:
+
+    vp_fig = go.Figure()
+
+    vp_fig.add_bar(
+        x=vp["volume"],
+        y=vp["price"],
+        orientation="h"
+    )
+
+    st.plotly_chart(vp_fig, use_container_width=True)
+
+else:
+    st.write("Volume profile unavailable")
